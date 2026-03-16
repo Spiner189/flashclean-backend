@@ -25,12 +25,97 @@
 require('dotenv').config();
 
 const express    = require('express');
+const helmet     = require('helmet');
+const rateLimit  = require('express-rate-limit');
+const sqlite3    = require('sqlite3').verbose();
 const stripe     = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const twilio     = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const nodemailer = require('nodemailer');
+const crypto     = require('crypto');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+app.disable('x-powered-by');
+// needed for correct client IP when behind Railway/Cloudflare/etc
+app.set('trust proxy', 1);
+
+// ── SQLITE (WEBHOOK IDEMPOTENCY) ─────────────────────────────
+const db = new sqlite3.Database('./flashclean.db', (err) => {
+  if (err) {
+    console.error('[sqlite] Failed to open database:', err.message);
+  } else {
+    console.log('[sqlite] Database opened');
+  }
+});
+
+db.serialize(() => {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS processed_events (
+       id          TEXT PRIMARY KEY,
+       type        TEXT,
+       created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+     )`,
+    (err) => {
+      if (err) console.error('[sqlite] Failed to ensure processed_events table:', err.message);
+    }
+  );
+});
+
+app.use(helmet({
+  // This backend is API-only; CSP is usually managed by the frontend.
+  contentSecurityPolicy: false,
+}));
+
+function getAllowedOrigins() {
+  // Prefer ALLOWED_ORIGINS="https://a.com,https://b.com" but keep backwards-compatible ALLOWED_ORIGIN.
+  const list = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || 'https://flashclean.com.au')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  return new Set(list);
+}
+
+const allowedOrigins = getAllowedOrigins();
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const sensitiveLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+function constantTimeEquals(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function requireAdminKey(req, res, next) {
+  // Do NOT accept secrets in JSON body (they may be logged by proxies).
+  const key = req.get('x-capture-key');
+  if (!process.env.CAPTURE_SECRET_KEY) return res.status(500).json({ error: 'Server misconfigured.' });
+  if (!constantTimeEquals(key, process.env.CAPTURE_SECRET_KEY)) return res.status(401).json({ error: 'Unauthorized.' });
+  next();
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
 
 // ── EMAIL TRANSPORTER ────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -42,23 +127,44 @@ const transporter = nodemailer.createTransport({
 });
 
 // ── CORS ─────────────────────────────────────────────────────
+app.use(apiLimiter);
 app.use((req, res, next) => {
-  const origin = process.env.ALLOWED_ORIGIN || 'https://flashclean.com.au';
-  res.setHeader('Access-Control-Allow-Origin', origin);
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Stripe-Signature, X-Capture-Key');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 // ── WEBHOOK must be raw body BEFORE express.json() ───────────
-app.post('/webhook', express.raw({ type: 'application/json' }), handleWebhook);
+app.post('/webhook', express.raw({ type: 'application/json', limit: '1mb' }), handleWebhook);
 
 // ── JSON body parser for all other routes ────────────────────
-app.use(express.json());
+app.use(express.json({ limit: '50kb' }));
 
 // ── HEALTH CHECK ─────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Flash Clean Backend' }));
+
+// ── DEBUG (DISABLED BY DEFAULT) ──────────────────────────────
+app.get('/debug/webhook-events', sensitiveLimiter, requireAdminKey, (req, res) => {
+  if (process.env.ENABLE_DEBUG_ENDPOINTS !== 'true') {
+    return res.status(404).json({ error: 'Not found.' });
+  }
+
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+  db.all(
+    'SELECT id, type, created_at FROM processed_events ORDER BY created_at DESC LIMIT ?',
+    [limit],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Database error.' });
+      res.json({ count: rows.length, events: rows });
+    }
+  );
+});
 
 
 // ════════════════════════════════════════════════════════════
@@ -70,22 +176,25 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Flash Clean 
 app.post('/create-payment-intent', async (req, res) => {
   const { amount, currency, description, receipt_email, metadata, idempotencyKey } = req.body;
 
-  if (!amount || amount < 50) {
+  // SECURITY: ideally compute price server-side from a booking ID.
+  // At minimum, enforce integer cents with a sane min/max to reduce tampering impact.
+  const amountCents = Number(amount);
+  if (!Number.isFinite(amountCents) || !Number.isInteger(amountCents) || amountCents < 50 || amountCents > 500000) {
     return res.status(400).json({ error: 'Invalid amount.' });
   }
 
   try {
     const paymentIntent = await stripe.paymentIntents.create(
       {
-        amount:         Math.round(amount),
-        currency:       currency || 'aud',
-        description:    description || 'Flash Clean Booking',
+        amount:         amountCents,
+        currency:       (currency || 'aud').toLowerCase(),
+        description:    typeof description === 'string' ? description.slice(0, 500) : 'Flash Clean Booking',
         receipt_email:  receipt_email || undefined,
-        metadata:       metadata || {},
+        metadata:       (metadata && typeof metadata === 'object') ? metadata : {},
         capture_method: 'manual',   // ✅ Hold card — capture after job is done
       },
       {
-        idempotencyKey,             // ✅ Prevents double-charges on retry
+        idempotencyKey: typeof idempotencyKey === 'string' ? idempotencyKey : undefined, // ✅ Prevents double-charges on retry
       }
     );
 
@@ -104,7 +213,7 @@ app.post('/create-payment-intent', async (req, res) => {
 //  Sends: WhatsApp + customer confirmation email + business alert
 // ════════════════════════════════════════════════════════════
 app.post('/notify', async (req, res) => {
-  const { bookingData, paid, paymentId } = req.body;
+  const { bookingData, paymentIntentId } = req.body;
 
   if (!bookingData || !bookingData['Name']) {
     return res.status(400).json({ error: 'Invalid booking data.' });
@@ -112,28 +221,49 @@ app.post('/notify', async (req, res) => {
 
   const b = bookingData;
 
+  // SECURITY: do not trust a client-provided "paid" flag. Verify with Stripe.
+  let verifiedStatus = 'unverified';
+  let verifiedAmountCents = null;
+  let verifiedCurrency = null;
+  if (paymentIntentId) {
+    try {
+      const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+      verifiedStatus = pi.status; // e.g. requires_capture, succeeded, requires_payment_method
+      verifiedAmountCents = pi.amount;
+      verifiedCurrency = pi.currency;
+    } catch (err) {
+      console.warn('[/notify] Unable to verify paymentIntentId:', err.message);
+    }
+  }
+
+  const paid =
+    verifiedStatus === 'requires_capture' ||
+    verifiedStatus === 'succeeded' ||
+    verifiedStatus === 'processing';
+
   // ── WHATSAPP ─────────────────────────────────────────────
   const msg =
-    (paid ? '💰 PAYMENT RECEIVED – NEW BOOKING\n\n' : '🧹 NEW FLASH CLEAN BOOKING\n\n') +
-    '👤 Name: '      + b['Name']          + '\n' +
-    '📞 Phone: '     + b['Phone']         + '\n' +
-    '📧 Email: '     + b['Email']         + '\n\n' +
-    '🏠 Service: '   + b['Service']       + '\n' +
-    '🔄 Frequency: ' + b['Frequency']     + '\n' +
-    '🛏 Beds: '      + b['Bedrooms']      + '  🚿 Baths: ' + b['Bathrooms'] + '\n' +
-    '💰 Price: '     + b['Est. Price']    + (paid ? ' ✅ AUTHORISED' : '') + '\n' +
-    (paymentId ? '🔑 Stripe ID: ' + paymentId + '\n' : '') +
-    '📅 Date: '      + b['Pref. Date']    + '  ⏰ ' + b['Pref. Time'] + '\n\n' +
-    '📍 Address: '   + b['Address']       + '\n\n' +
+    (paid ? '💰 PAYMENT AUTHORISED – NEW BOOKING\n\n' : '🧹 NEW FLASH CLEAN BOOKING\n\n') +
+    '👤 Name: '      + (b['Name'] || '')          + '\n' +
+    '📞 Phone: '     + (b['Phone'] || '')         + '\n' +
+    '📧 Email: '     + (b['Email'] || '')         + '\n\n' +
+    '🏠 Service: '   + (b['Service'] || '')       + '\n' +
+    '🔄 Frequency: ' + (b['Frequency'] || '')     + '\n' +
+    '🛏 Beds: '      + (b['Bedrooms'] || '')      + '  🚿 Baths: ' + (b['Bathrooms'] || '') + '\n' +
+    '💰 Price: '     + (b['Est. Price'] || '')    + (paid ? ' ✅ AUTHORISED' : '') + '\n' +
+    (paymentIntentId ? '🔑 Stripe PI: ' + paymentIntentId + '\n' : '') +
+    (paymentIntentId ? '🧾 Verified: ' + verifiedStatus + '\n' : '') +
+    '📅 Date: '      + (b['Pref. Date'] || '')    + '  ⏰ ' + (b['Pref. Time'] || '') + '\n\n' +
+    '📍 Address: '   + (b['Address'] || '')       + '\n\n' +
     '➕ Extras:\n' +
-    '  Oven: '            + b['Oven Cleaning']     + '\n' +
-    '  Fridge: '          + b['Fridge Cleaning']   + '\n' +
-    '  Int. Windows: '    + b['Interior Windows']  + '\n' +
-    '  Ext. Windows: '    + b['External Windows']  + '\n' +
-    '  Laundry: '         + b['Laundry/Ironing']   + '\n' +
-    '  Carpet: '          + b['Carpet Cleaning']   + '\n\n' +
+    '  Oven: '            + (b['Oven Cleaning'] || '')     + '\n' +
+    '  Fridge: '          + (b['Fridge Cleaning'] || '')   + '\n' +
+    '  Int. Windows: '    + (b['Interior Windows'] || '')  + '\n' +
+    '  Ext. Windows: '    + (b['External Windows'] || '')  + '\n' +
+    '  Laundry: '         + (b['Laundry/Ironing'] || '')   + '\n' +
+    '  Carpet: '          + (b['Carpet Cleaning'] || '')   + '\n\n' +
     (b['Special Notes'] ? '📝 Notes: ' + b['Special Notes'] + '\n\n' : '') +
-    '🔑 Access: '    + b['Home Access'];
+    '🔑 Access: '    + (b['Home Access'] || '');
 
   // ── CUSTOMER EMAIL ───────────────────────────────────────
   const customerEmail = {
@@ -148,28 +278,28 @@ app.post('/notify', async (req, res) => {
         </div>
         <div style="background:#fff;padding:35px 40px;">
           <h2 style="color:#0f172a;margin:0 0 8px;">Your booking is confirmed! 🎉</h2>
-          <p style="color:#475569;margin:0 0 24px;">Hi ${b['Name']}, thanks for booking with Flash Clean. Here's your booking summary:</p>
+          <p style="color:#475569;margin:0 0 24px;">Hi ${escapeHtml(b['Name'])}, thanks for booking with Flash Clean. Here's your booking summary:</p>
           <div style="background:#f0f9ff;border-left:4px solid #0ea5e9;border-radius:8px;padding:20px 24px;margin-bottom:24px;">
             <table style="width:100%;border-collapse:collapse;">
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;width:130px;">📋 Service</td>    <td style="padding:6px 0;color:#0f172a;font-weight:600;font-size:14px;">${b['Service']}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">🔄 Frequency</td>  <td style="padding:6px 0;color:#0f172a;font-size:14px;">${b['Frequency']}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">📅 Date</td>        <td style="padding:6px 0;color:#0f172a;font-size:14px;">${b['Pref. Date']}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">⏰ Time</td>        <td style="padding:6px 0;color:#0f172a;font-size:14px;">${b['Pref. Time']}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">📍 Address</td>     <td style="padding:6px 0;color:#0f172a;font-size:14px;">${b['Address']}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">🛏 Bedrooms</td>    <td style="padding:6px 0;color:#0f172a;font-size:14px;">${b['Bedrooms']}</td></tr>
-              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">🚿 Bathrooms</td>   <td style="padding:6px 0;color:#0f172a;font-size:14px;">${b['Bathrooms']}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;width:130px;">📋 Service</td>    <td style="padding:6px 0;color:#0f172a;font-weight:600;font-size:14px;">${escapeHtml(b['Service'])}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">🔄 Frequency</td>  <td style="padding:6px 0;color:#0f172a;font-size:14px;">${escapeHtml(b['Frequency'])}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">📅 Date</td>        <td style="padding:6px 0;color:#0f172a;font-size:14px;">${escapeHtml(b['Pref. Date'])}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">⏰ Time</td>        <td style="padding:6px 0;color:#0f172a;font-size:14px;">${escapeHtml(b['Pref. Time'])}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">📍 Address</td>     <td style="padding:6px 0;color:#0f172a;font-size:14px;">${escapeHtml(b['Address'])}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">🛏 Bedrooms</td>    <td style="padding:6px 0;color:#0f172a;font-size:14px;">${escapeHtml(b['Bedrooms'])}</td></tr>
+              <tr><td style="padding:6px 0;color:#64748b;font-size:14px;">🚿 Bathrooms</td>   <td style="padding:6px 0;color:#0f172a;font-size:14px;">${escapeHtml(b['Bathrooms'])}</td></tr>
               ${b['Oven Cleaning']    === 'Yes' ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">✅ Extra</td><td style="padding:6px 0;font-size:14px;">Oven Cleaning</td></tr>` : ''}
               ${b['Fridge Cleaning']  === 'Yes' ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">✅ Extra</td><td style="padding:6px 0;font-size:14px;">Fridge Cleaning</td></tr>` : ''}
               ${b['Interior Windows'] === 'Yes' ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">✅ Extra</td><td style="padding:6px 0;font-size:14px;">Interior Windows</td></tr>` : ''}
               ${b['External Windows'] === 'Yes' ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">✅ Extra</td><td style="padding:6px 0;font-size:14px;">External Windows</td></tr>` : ''}
               ${b['Laundry/Ironing']  === 'Yes' ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">✅ Extra</td><td style="padding:6px 0;font-size:14px;">Laundry/Ironing</td></tr>` : ''}
               ${b['Carpet Cleaning']  === 'Yes' ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">✅ Extra</td><td style="padding:6px 0;font-size:14px;">Carpet Cleaning</td></tr>` : ''}
-              ${b['Special Notes'] ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">📝 Notes</td><td style="padding:6px 0;font-size:14px;">${b['Special Notes']}</td></tr>` : ''}
+              ${b['Special Notes'] ? `<tr><td style="padding:6px 0;color:#64748b;font-size:14px;">📝 Notes</td><td style="padding:6px 0;font-size:14px;">${escapeHtml(b['Special Notes'])}</td></tr>` : ''}
             </table>
           </div>
           <div style="background:#0ea5e9;border-radius:8px;padding:16px 24px;margin-bottom:24px;text-align:center;">
             <p style="color:#e0f2fe;margin:0 0 4px;font-size:13px;">Total Amount (Card Authorised)</p>
-            <p style="color:#fff;margin:0;font-size:28px;font-weight:900;">${b['Est. Price']}</p>
+            <p style="color:#fff;margin:0;font-size:28px;font-weight:900;">${escapeHtml(b['Est. Price'])}</p>
             <p style="color:#bbf7d0;margin:4px 0 0;font-size:12px;">✅ Your card has been authorised. Payment is collected after your clean is complete.</p>
           </div>
           <p style="color:#475569;font-size:14px;margin:0 0 8px;">Need to make changes? Contact us:</p>
@@ -192,19 +322,20 @@ app.post('/notify', async (req, res) => {
       <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;">
         <h2 style="color:#0ea5e9;margin:0 0 16px;">⚡ New Flash Clean Booking</h2>
         <table style="width:100%;border-collapse:collapse;font-size:14px;">
-          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;width:140px;">👤 Name</td>       <td style="padding:8px 12px;font-weight:600;">${b['Name']}</td></tr>
-          <tr>                            <td style="padding:8px 12px;color:#64748b;">📞 Phone</td>      <td style="padding:8px 12px;">${b['Phone']}</td></tr>
-          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">📧 Email</td>      <td style="padding:8px 12px;">${b['Email']}</td></tr>
-          <tr>                            <td style="padding:8px 12px;color:#64748b;">🏠 Service</td>    <td style="padding:8px 12px;">${b['Service']}</td></tr>
-          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">🔄 Frequency</td> <td style="padding:8px 12px;">${b['Frequency']}</td></tr>
-          <tr>                            <td style="padding:8px 12px;color:#64748b;">📅 Date</td>       <td style="padding:8px 12px;">${b['Pref. Date']}</td></tr>
-          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">⏰ Time</td>       <td style="padding:8px 12px;">${b['Pref. Time']}</td></tr>
-          <tr>                            <td style="padding:8px 12px;color:#64748b;">📍 Address</td>    <td style="padding:8px 12px;">${b['Address']}</td></tr>
-          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">🛏 Beds/Baths</td><td style="padding:8px 12px;">${b['Bedrooms']} bed / ${b['Bathrooms']} bath</td></tr>
-          <tr>                            <td style="padding:8px 12px;color:#64748b;">💰 Price</td>      <td style="padding:8px 12px;font-weight:700;color:#0ea5e9;">${b['Est. Price']} ${paid ? '✅ AUTHORISED' : ''}</td></tr>
-          ${paymentId ? `<tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">🔑 Stripe ID</td><td style="padding:8px 12px;font-family:monospace;">${paymentId}</td></tr>` : ''}
-          <tr>                            <td style="padding:8px 12px;color:#64748b;">🔑 Access</td>     <td style="padding:8px 12px;">${b['Home Access']}</td></tr>
-          ${b['Special Notes'] ? `<tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">📝 Notes</td><td style="padding:8px 12px;">${b['Special Notes']}</td></tr>` : ''}
+          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;width:140px;">👤 Name</td>       <td style="padding:8px 12px;font-weight:600;">${escapeHtml(b['Name'])}</td></tr>
+          <tr>                            <td style="padding:8px 12px;color:#64748b;">📞 Phone</td>      <td style="padding:8px 12px;">${escapeHtml(b['Phone'])}</td></tr>
+          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">📧 Email</td>      <td style="padding:8px 12px;">${escapeHtml(b['Email'])}</td></tr>
+          <tr>                            <td style="padding:8px 12px;color:#64748b;">🏠 Service</td>    <td style="padding:8px 12px;">${escapeHtml(b['Service'])}</td></tr>
+          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">🔄 Frequency</td> <td style="padding:8px 12px;">${escapeHtml(b['Frequency'])}</td></tr>
+          <tr>                            <td style="padding:8px 12px;color:#64748b;">📅 Date</td>       <td style="padding:8px 12px;">${escapeHtml(b['Pref. Date'])}</td></tr>
+          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">⏰ Time</td>       <td style="padding:8px 12px;">${escapeHtml(b['Pref. Time'])}</td></tr>
+          <tr>                            <td style="padding:8px 12px;color:#64748b;">📍 Address</td>    <td style="padding:8px 12px;">${escapeHtml(b['Address'])}</td></tr>
+          <tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">🛏 Beds/Baths</td><td style="padding:8px 12px;">${escapeHtml(b['Bedrooms'])} bed / ${escapeHtml(b['Bathrooms'])} bath</td></tr>
+          <tr>                            <td style="padding:8px 12px;color:#64748b;">💰 Price</td>      <td style="padding:8px 12px;font-weight:700;color:#0ea5e9;">${escapeHtml(b['Est. Price'])} ${paid ? '✅ AUTHORISED' : ''}</td></tr>
+          ${paymentIntentId ? `<tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">🔑 Stripe PI</td><td style="padding:8px 12px;font-family:monospace;">${escapeHtml(paymentIntentId)}</td></tr>` : ''}
+          ${paymentIntentId ? `<tr><td style="padding:8px 12px;color:#64748b;">🧾 Verified</td><td style="padding:8px 12px;">${escapeHtml(verifiedStatus)} (${verifiedCurrency ? escapeHtml(verifiedCurrency.toUpperCase()) : ''}${verifiedAmountCents ? ' ' + (verifiedAmountCents / 100).toFixed(2) : ''})</td></tr>` : ''}
+          <tr>                            <td style="padding:8px 12px;color:#64748b;">🔑 Access</td>     <td style="padding:8px 12px;">${escapeHtml(b['Home Access'])}</td></tr>
+          ${b['Special Notes'] ? `<tr style="background:#f0f9ff;"><td style="padding:8px 12px;color:#64748b;">📝 Notes</td><td style="padding:8px 12px;">${escapeHtml(b['Special Notes'])}</td></tr>` : ''}
         </table>
         <div style="margin-top:16px;padding:12px 16px;background:#fef3c7;border-radius:6px;font-size:13px;color:#92400e;">
           ⚠️ Card is <strong>authorised (on hold)</strong> — capture payment after job is complete.
@@ -240,11 +371,11 @@ app.post('/notify', async (req, res) => {
 // ════════════════════════════════════════════════════════════
 //  POST /capture
 //  Capture payment after job is complete (original amount)
-//  Body: { "paymentIntentId": "pi_xxx", "captureKey": "secret" }
+//  Header: X-Capture-Key: <secret>
+//  Body: { "paymentIntentId": "pi_xxx" }
 // ════════════════════════════════════════════════════════════
-app.post('/capture', async (req, res) => {
-  const { paymentIntentId, captureKey } = req.body;
-  if (captureKey !== process.env.CAPTURE_SECRET_KEY) return res.status(401).json({ error: 'Unauthorized.' });
+app.post('/capture', sensitiveLimiter, requireAdminKey, async (req, res) => {
+  const { paymentIntentId } = req.body;
   if (!paymentIntentId) return res.status(400).json({ error: 'Missing paymentIntentId.' });
   try {
     const pi = await stripe.paymentIntents.capture(paymentIntentId);
@@ -261,11 +392,11 @@ app.post('/capture', async (req, res) => {
 //  POST /capture-with-amount
 //  Capture with a DIFFERENT amount (e.g. customer added extras)
 //  Amount must be within the original authorized amount.
-//  Body: { "paymentIntentId": "pi_xxx", "amountCents": 21000, "captureKey": "secret" }
+//  Header: X-Capture-Key: <secret>
+//  Body: { "paymentIntentId": "pi_xxx", "amountCents": 21000 }
 // ════════════════════════════════════════════════════════════
-app.post('/capture-with-amount', async (req, res) => {
-  const { paymentIntentId, amountCents, captureKey } = req.body;
-  if (captureKey !== process.env.CAPTURE_SECRET_KEY) return res.status(401).json({ error: 'Unauthorized.' });
+app.post('/capture-with-amount', sensitiveLimiter, requireAdminKey, async (req, res) => {
+  const { paymentIntentId, amountCents } = req.body;
   if (!paymentIntentId || !amountCents) return res.status(400).json({ error: 'Missing fields.' });
   try {
     await stripe.paymentIntents.update(paymentIntentId, { amount: Math.round(amountCents) });
@@ -282,11 +413,11 @@ app.post('/capture-with-amount', async (req, res) => {
 // ════════════════════════════════════════════════════════════
 //  POST /cancel-authorization
 //  Release the hold without charging (job cancelled)
-//  Body: { "paymentIntentId": "pi_xxx", "captureKey": "secret" }
+//  Header: X-Capture-Key: <secret>
+//  Body: { "paymentIntentId": "pi_xxx" }
 // ════════════════════════════════════════════════════════════
-app.post('/cancel-authorization', async (req, res) => {
-  const { paymentIntentId, captureKey } = req.body;
-  if (captureKey !== process.env.CAPTURE_SECRET_KEY) return res.status(401).json({ error: 'Unauthorized.' });
+app.post('/cancel-authorization', sensitiveLimiter, requireAdminKey, async (req, res) => {
+  const { paymentIntentId } = req.body;
   try {
     const pi = await stripe.paymentIntents.cancel(paymentIntentId);
     console.log('[/cancel-auth] ✅ Cancelled:', pi.id);
@@ -302,11 +433,11 @@ app.post('/cancel-authorization', async (req, res) => {
 //  POST /charge-extra
 //  Charge extra to same card AFTER original payment captured.
 //  Body: { "originalPaymentIntentId": "pi_xxx", "extraAmountCents": 6000,
-//          "description": "Oven add-on", "captureKey": "secret" }
+//          "description": "Oven add-on" }
+//  Header: X-Capture-Key: <secret>
 // ════════════════════════════════════════════════════════════
-app.post('/charge-extra', async (req, res) => {
-  const { originalPaymentIntentId, extraAmountCents, description, captureKey } = req.body;
-  if (captureKey !== process.env.CAPTURE_SECRET_KEY) return res.status(401).json({ error: 'Unauthorized.' });
+app.post('/charge-extra', sensitiveLimiter, requireAdminKey, async (req, res) => {
+  const { originalPaymentIntentId, extraAmountCents, description } = req.body;
   if (!originalPaymentIntentId || !extraAmountCents) return res.status(400).json({ error: 'Missing fields.' });
   try {
     const original = await stripe.paymentIntents.retrieve(originalPaymentIntentId);
@@ -349,7 +480,41 @@ async function handleWebhook(req, res) {
     return res.status(400).send('Webhook error');
   }
 
-  switch (event.type) {
+  // Idempotency: skip events we've already processed
+  const eventId = event.id;
+  const eventType = event.type;
+
+  db.get('SELECT id FROM processed_events WHERE id = ?', [eventId], (err, row) => {
+    if (err) {
+      console.error('[/webhook] DB error checking idempotency:', err.message);
+      // Fail closed: do not acknowledge to Stripe so it can retry later.
+      return res.status(500).send('Webhook storage error');
+    }
+
+    if (row) {
+      console.log('[/webhook] Duplicate event ignored:', eventId, eventType);
+      return res.json({ received: true, duplicate: true });
+    }
+
+    db.run(
+      'INSERT INTO processed_events (id, type) VALUES (?, ?)',
+      [eventId, eventType],
+      (insertErr) => {
+        if (insertErr) {
+          console.error('[/webhook] DB insert error:', insertErr.message);
+          return res.status(500).send('Webhook storage error');
+        }
+
+        processWebhookEvent(event, res);
+      }
+    );
+  });
+}
+
+function processWebhookEvent(event, res) {
+  const type = event.type;
+
+  switch (type) {
     case 'payment_intent.amount_capturable_updated': {
       const pi = event.data.object;
       console.log('[/webhook] 🔒 Card authorised (hold placed):', pi.id, '$' + pi.amount / 100);
