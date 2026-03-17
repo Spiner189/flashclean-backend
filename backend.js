@@ -126,6 +126,15 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// Validate SMTP credentials at startup (logs only, no secrets)
+transporter.verify()
+  .then(() => {
+    console.log('[email] ✅ SMTP transporter verified for:', process.env.EMAIL_USER);
+  })
+  .catch((err) => {
+    console.error('[email] ❌ SMTP verify failed:', err?.code, err?.command, err?.message);
+  });
+
 // ── CORS ─────────────────────────────────────────────────────
 app.use(apiLimiter);
 app.use((req, res, next) => {
@@ -356,13 +365,17 @@ app.post('/notify', async (req, res) => {
     await transporter.sendMail(customerEmail);
     results.customerEmail = true;
     console.log('[/notify] ✅ Customer email sent to:', b['Email']);
-  } catch (err) { console.error('[/notify] Customer email error:', err.message); }
+  } catch (err) {
+    console.error('[/notify] Customer email error:', err?.code, err?.command, err?.response, err?.message);
+  }
 
   try {
     await transporter.sendMail(businessEmail);
     results.businessEmail = true;
     console.log('[/notify] ✅ Business email sent to:', process.env.EMAIL_TO);
-  } catch (err) { console.error('[/notify] Business email error:', err.message); }
+  } catch (err) {
+    console.error('[/notify] Business email error:', err?.code, err?.command, err?.response, err?.message);
+  }
 
   res.json({ sent: true, results });
 });
