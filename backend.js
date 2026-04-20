@@ -139,6 +139,7 @@ function buildTransporter(host) {
     auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     // SNI must be the hostname since host is an IP literal.
     tls: { servername: SMTP_HOST, family: 4 },
+    lookup: (hostname, opts, cb) => dns.lookup(hostname, { family: 4 }, cb),
     family: 4,
     connectionTimeout: 15_000,
     greetingTimeout: 15_000,
