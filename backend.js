@@ -118,12 +118,47 @@ function escapeHtml(value) {
 }
 
 // ── EMAIL TRANSPORTER ────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
+// Railway has no IPv6 egress. Pre-resolve smtp.gmail.com to IPv4 and connect by IP literal,
+// so no library code path can re-resolve and pick the AAAA record.
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_SECURE = process.env.SMTP_SECURE
+  ? process.env.SMTP_SECURE === 'true'
+  : SMTP_PORT === 465;
+
+let transporter; // reassigned once IPv4 resolves
+
+function buildTransporter(host) {
+  return nodemailer.createTransport({
+    host,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+    // SNI must be the hostname since host is an IP literal.
+    tls: { servername: SMTP_HOST, family: 4 },
+    family: 4,
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
+  });
+}
+
+// Initial transporter uses the hostname; gets replaced with IPv4 literal once resolved.
+transporter = buildTransporter(SMTP_HOST);
+
+dns.lookup(SMTP_HOST, { family: 4 }, (err, address) => {
+  if (err) {
+    console.error('[email] ❌ IPv4 lookup failed for', SMTP_HOST, err.message);
+    return;
+  }
+  console.log('[email] Resolved', SMTP_HOST, '→', address, '(IPv4)');
+  transporter = buildTransporter(address);
+  transporter.verify()
+    .then(() => console.log('[email] ✅ SMTP verified via IPv4:', address))
+    .catch(e => console.error('[email] ❌ SMTP verify failed:', e.code, e.message));
 });
 
 // Validate SMTP credentials at startup (logs only, no secrets)
